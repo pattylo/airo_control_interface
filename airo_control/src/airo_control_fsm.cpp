@@ -3,6 +3,7 @@
 AIRO_CONTROL_FSM::AIRO_CONTROL_FSM(ros::NodeHandle& nh){
     // ROS Parameters
     nh.getParam("airo_control_node/fsm/controller_type",CONTROLLER_TYPE);
+    nh.getParam("airo_control_node/fsm/enable_logging",ENABLE_LOGGING);
     nh.getParam("airo_control_node/fsm/pose_topic",POSE_TOPIC);
     nh.getParam("airo_control_node/fsm/twist_topic",TWIST_TOPIC);
     nh.getParam("airo_control_node/fsm/state_timeout",STATE_TIMEOUT);
@@ -42,9 +43,10 @@ AIRO_CONTROL_FSM::AIRO_CONTROL_FSM(ros::NodeHandle& nh){
     state_sub = nh.subscribe<mavros_msgs::State>("/mavros/state",1,&AIRO_CONTROL_FSM::state_cb,this);
     extended_state_sub = nh.subscribe<mavros_msgs::ExtendedState>("/mavros/extended_state",1,&AIRO_CONTROL_FSM::extended_state_cb,this);
     rc_input_sub = nh.subscribe<mavros_msgs::RCIn>("/mavros/rc/in",1,&AIRO_CONTROL_FSM::rc_input_cb,this);
-    command_sub = nh.subscribe<airo_message::Reference>("/airo_control/setpoint",1,&AIRO_CONTROL_FSM::external_command_cb,this);
+    command_sub = nh.subscribe<airo_message::ReferenceStamped>("/airo_control/setpoint",1,&AIRO_CONTROL_FSM::external_command_cb,this);
     command_preview_sub = nh.subscribe<airo_message::ReferencePreview>("/airo_control/setpoint_preview",5,&AIRO_CONTROL_FSM::external_command_preview_cb,this);
     takeoff_land_sub = nh.subscribe<airo_message::TakeoffLandTrigger>("/airo_control/takeoff_land_trigger",1,&AIRO_CONTROL_FSM::takeoff_land_cb,this);
+    battery_state_sub = nh.subscribe<sensor_msgs::BatteryState>("/mavros/battery",1,&AIRO_CONTROL_FSM::battery_state_cb,this);
     setpoint_pub = nh.advertise<mavros_msgs::AttitudeTarget>("/mavros/setpoint_raw/attitude",1);
     fsm_info_pub = nh.advertise<airo_message::FSMInfo>("/airo_control/fsm_info",1);
 
@@ -55,6 +57,9 @@ AIRO_CONTROL_FSM::AIRO_CONTROL_FSM(ros::NodeHandle& nh){
 
     // Initialize FSM & Controller 
     state_fsm = RC_MANUAL;
+    if (ENABLE_LOGGING){
+        init_log();
+    }
     if (CONTROLLER_TYPE == "mpc"){
         controller = std::make_unique<MPC>(nh);
     }
@@ -75,9 +80,7 @@ AIRO_CONTROL_FSM::AIRO_CONTROL_FSM(ros::NodeHandle& nh){
         enable_preview = dummy_mpc->param.enable_preview;
         if (enable_preview){
             controller_ref_preview.header.stamp = ros::Time::now();
-            controller_ref_preview.ref_pose.resize(QUADROTOR_N+1);
-            controller_ref_preview.ref_twist.resize(QUADROTOR_N+1);
-            controller_ref_preview.ref_accel.resize(QUADROTOR_N+1);
+            controller_ref_preview.ref_preview.resize(QUADROTOR_N+1);
         }
     }
 
@@ -89,8 +92,8 @@ AIRO_CONTROL_FSM::AIRO_CONTROL_FSM(ros::NodeHandle& nh){
         else {
             ROS_WARN_STREAM_THROTTLE(5.0,"[AIRo Control] Odom not received!");
         }
-        ros::spinOnce();
         ros::Duration(0.05).sleep();
+        ros::spinOnce();
     }
     ROS_INFO("[AIRo Control] Connected to vehicle. FSM spinning!");
 }
@@ -112,11 +115,11 @@ void AIRO_CONTROL_FSM::process(){
     // Step 3: Solve position controller if needed
     if(solve_controller){
         if (!use_preview){
-            attitude_target = controller->solve(local_pose,local_twist,local_accel,controller_ref);
+            attitude_target = controller->solve(local_pose,local_twist,local_accel,controller_ref,battery_state);
         }
         else{
             MPC* dummy_mpc = dynamic_cast<MPC*>(controller.get());
-            attitude_target = dummy_mpc->solve(local_pose,local_twist,local_accel,controller_ref_preview);
+            attitude_target = dummy_mpc->solve(local_pose,local_twist,local_accel,controller_ref_preview,battery_state);
         }
     }
 
@@ -131,7 +134,12 @@ void AIRO_CONTROL_FSM::process(){
     fsm_info.is_landed = is_landed;
     fsm_info_pub.publish(fsm_info);
 
-    // Step 6: Reset all variables
+    // Step 6: log data if needed
+    if (ENABLE_LOGGING){
+        update_log();
+    }
+
+    // Step 7: Reset all variables
 	rc_input.enter_fsm = false;
 	rc_input.enter_reboot = false;
     use_preview = false;
@@ -159,7 +167,7 @@ void AIRO_CONTROL_FSM::fsm(){
 
             // To AUTO_TAKEOFF
             else if ((rc_input.enter_fsm && !rc_input.is_command && is_landed)
-                  || (takeoff_trigered(current_time) && rc_input.is_command && is_landed)){
+                  || (takeoff_trigered(current_time) && rc_input.is_fsm && rc_input.is_command && is_landed)){
                 if (!odom_received(current_time)){
                     ROS_ERROR_STREAM_THROTTLE(1.0, "[AIRo Control] Reject AUTO_TAKEOFF. No odom or imu!");
                     break;
@@ -506,14 +514,14 @@ void AIRO_CONTROL_FSM::set_ref(const geometry_msgs::PoseStamped& pose){
     geometry_msgs::Pose dummy_pose;
     dummy_pose.position = pose.pose.position;
     dummy_pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, extract_yaw_from_quaternion(pose.pose.orientation));
-    
-    controller_ref.ref_pose = dummy_pose;
-    controller_ref.ref_twist.linear.x = 0;
-    controller_ref.ref_twist.linear.y = 0;
-    controller_ref.ref_twist.linear.z = 0;
-    controller_ref.ref_accel.linear.x = 0;
-    controller_ref.ref_accel.linear.y = 0;
-    controller_ref.ref_accel.linear.z = 0;
+
+    controller_ref.ref.pose = dummy_pose;
+    controller_ref.ref.twist.linear.x = 0;
+    controller_ref.ref.twist.linear.y = 0;
+    controller_ref.ref.twist.linear.z = 0;
+    controller_ref.ref.accel.linear.x = 0;
+    controller_ref.ref.accel.linear.y = 0;
+    controller_ref.ref.accel.linear.z = 0;
 
     solve_controller = true;
 }
@@ -538,11 +546,11 @@ void AIRO_CONTROL_FSM::set_ref_with_rc(){
     geometry_msgs::PoseStamped rc_ref;
     double rc_psi, controller_psi;
 
-    controller_psi = extract_yaw_from_quaternion(controller_ref.ref_pose.orientation);
+    controller_psi = extract_yaw_from_quaternion(controller_ref.ref.pose.orientation);
     rc_ref.header.stamp = current_time;
-    rc_ref.pose.position.x = controller_ref.ref_pose.position.x + rc_input.channel[rc_param.PITCH_CHANNEL-1]*HOVER_MAX_VELOCITY*delta_t*(rc_param.REVERSE_PITCH ? -1 : 1);
-    rc_ref.pose.position.y = controller_ref.ref_pose.position.y - rc_input.channel[rc_param.ROLL_CHANNEL-1]*HOVER_MAX_VELOCITY*delta_t*(rc_param.REVERSE_ROLL ? -1 : 1);
-    rc_ref.pose.position.z = controller_ref.ref_pose.position.z + rc_input.channel[rc_param.THROTTLE_CHANNEL-1]*HOVER_MAX_VELOCITY*delta_t*(rc_param.REVERSE_THROTTLE ? -1 : 1);
+    rc_ref.pose.position.x = controller_ref.ref.pose.position.x + rc_input.channel[rc_param.PITCH_CHANNEL-1]*HOVER_MAX_VELOCITY*delta_t*(rc_param.REVERSE_PITCH ? -1 : 1);
+    rc_ref.pose.position.y = controller_ref.ref.pose.position.y - rc_input.channel[rc_param.ROLL_CHANNEL-1]*HOVER_MAX_VELOCITY*delta_t*(rc_param.REVERSE_ROLL ? -1 : 1);
+    rc_ref.pose.position.z = controller_ref.ref.pose.position.z + rc_input.channel[rc_param.THROTTLE_CHANNEL-1]*HOVER_MAX_VELOCITY*delta_t*(rc_param.REVERSE_THROTTLE ? -1 : 1);
     rc_psi = controller_psi - rc_input.channel[rc_param.YAW_CHANNEL-1]*HOVER_MAX_YAW_RATE*delta_t*(rc_param.REVERSE_YAW ? -1 : 1);
 
     rc_ref.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, rc_psi);
@@ -553,10 +561,10 @@ void AIRO_CONTROL_FSM::set_ref_with_rc(){
 
 void AIRO_CONTROL_FSM::set_ref_with_external_command(){
     controller_ref.header = external_command.header;
-    controller_ref.ref_pose.position = check_safety_volumn(external_command.ref_pose.position);
-    controller_ref.ref_pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, extract_yaw_from_quaternion(external_command.ref_pose.orientation));
-    controller_ref.ref_twist = external_command.ref_twist;
-    controller_ref.ref_accel = external_command.ref_accel;
+    controller_ref.ref.pose.position = check_safety_volumn(external_command.ref.pose.position);
+    controller_ref.ref.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, extract_yaw_from_quaternion(external_command.ref.pose.orientation));
+    controller_ref.ref.twist = external_command.ref.twist;
+    controller_ref.ref.accel = external_command.ref.accel;
 
     solve_controller = true;
     fsm_info.is_waiting_for_command = true;
@@ -565,11 +573,11 @@ void AIRO_CONTROL_FSM::set_ref_with_external_command(){
 void AIRO_CONTROL_FSM::set_ref_with_external_command_preview(){
     controller_ref_preview.header = external_command_preview.header;
     for(int i = 0; i < QUADROTOR_N+1; i++){
-        controller_ref_preview.ref_pose[i].position = check_safety_volumn(external_command_preview.ref_pose[i].position);
-        controller_ref_preview.ref_pose[i].orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, extract_yaw_from_quaternion(external_command_preview.ref_pose[i].orientation));
+        controller_ref_preview.ref_preview[i].pose.position = check_safety_volumn(external_command_preview.ref_preview[i].pose.position);
+        controller_ref_preview.ref_preview[i].pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, extract_yaw_from_quaternion(external_command_preview.ref_preview[i].pose.orientation));
+        controller_ref_preview.ref_preview[i].twist = external_command_preview.ref_preview[i].twist;
+        controller_ref_preview.ref_preview[i].accel = external_command_preview.ref_preview[i].accel;
     }
-    controller_ref_preview.ref_twist = external_command_preview.ref_twist;
-    controller_ref_preview.ref_accel = external_command_preview.ref_accel;
 
     solve_controller = true;
     fsm_info.is_waiting_for_command = true;
@@ -605,7 +613,7 @@ void AIRO_CONTROL_FSM::land_detector(){
 	constexpr double TIME_KEEP = 2.0; // Constraint 3: Constraint 1&2 satisfied for TIME_KEEP seconds.
 
 	if (!is_landed){
-		bool C12_satisfy = (controller_ref.ref_pose.position.z - local_pose.pose.position.z) < POSITION_DEVIATION && twist_norm(local_twist) < VELOCITY_THRESHOLD;
+		bool C12_satisfy = (controller_ref.ref.pose.position.z - local_pose.pose.position.z) < POSITION_DEVIATION && twist_norm(local_twist) < VELOCITY_THRESHOLD;
         if (C12_satisfy && !is_last_C12_satisfy){
 			time_C12_reached = ros::Time::now();
 		}
@@ -621,6 +629,8 @@ void AIRO_CONTROL_FSM::land_detector(){
 void AIRO_CONTROL_FSM::motor_idle_and_disarm(){
     double last_disarm_time = 0;
     while(ros::ok()){
+        ros::spinOnce();
+        current_time = ros::Time::now();
         if (current_extended_state.landed_state == mavros_msgs::ExtendedState::LANDED_STATE_ON_GROUND){ // CONTROL allows disarm after this
             if (current_time.toSec() - last_disarm_time > 1.0){
                 if (toggle_arm(false)){ // Successful disarm
@@ -640,8 +650,6 @@ void AIRO_CONTROL_FSM::motor_idle_and_disarm(){
             publish_control_commands(attitude_target,current_time);
         }
         ros::Duration(0.05).sleep();
-        ros::spinOnce();
-        current_time = ros::Time::now();
     }
 }
 
@@ -723,25 +731,23 @@ void AIRO_CONTROL_FSM::rc_input_cb(const mavros_msgs::RCIn::ConstPtr& msg){
     }
 }
 
-void AIRO_CONTROL_FSM::external_command_cb(const airo_message::Reference::ConstPtr& msg){
+void AIRO_CONTROL_FSM::external_command_cb(const airo_message::ReferenceStamped::ConstPtr& msg){
     external_command.header.stamp = msg->header.stamp;
-    external_command.ref_pose = msg->ref_pose;
-    external_command.ref_twist = msg->ref_twist;
-    external_command.ref_accel = msg->ref_accel;
-    if (msg->ref_pose.orientation.w == 0.0 && msg->ref_pose.orientation.x == 0.0 && msg->ref_pose.orientation.y == 0.0 && msg->ref_pose.orientation.z == 0.0){
-        external_command.ref_pose.orientation.w = 1.0;
+    external_command.ref.pose = msg->ref.pose;
+    external_command.ref.twist = msg->ref.twist;
+    external_command.ref.accel = msg->ref.accel;
+    if (msg->ref.pose.orientation.w == 0.0 && msg->ref.pose.orientation.x == 0.0 && msg->ref.pose.orientation.y == 0.0 && msg->ref.pose.orientation.z == 0.0){
+        external_command.ref.pose.orientation.w = 1.0;
     }
 }
 
 void AIRO_CONTROL_FSM::external_command_preview_cb(const airo_message::ReferencePreview::ConstPtr& msg){
-    if(msg->ref_pose.size() == QUADROTOR_N+1 && msg->ref_twist.size() == QUADROTOR_N+1 && msg->ref_accel.size() == QUADROTOR_N+1){
+    if(msg->ref_preview.size() == QUADROTOR_N+1){
         external_command_preview.header = msg->header;
-        external_command_preview.ref_pose = msg->ref_pose;
-        external_command_preview.ref_twist = msg->ref_twist;
-        external_command_preview.ref_accel = msg->ref_accel;
-        for (int i = 0; i < msg->ref_pose.size(); i++){
-            if (msg->ref_pose[i].orientation.w == 0.0 && msg->ref_pose[i].orientation.x == 0.0 && msg->ref_pose[i].orientation.y == 0.0 && msg->ref_pose[i].orientation.z == 0.0){
-                external_command.ref_pose.orientation.w = 1.0;
+        external_command_preview.ref_preview = msg->ref_preview;
+        for (int i = 0; i < msg->ref_preview.size(); i++){
+            if (msg->ref_preview[i].pose.orientation.w == 0.0 && msg->ref_preview[i].pose.orientation.x == 0.0 && msg->ref_preview[i].pose.orientation.y == 0.0 && msg->ref_preview[i].pose.orientation.z == 0.0){
+                external_command_preview.ref_preview[i].pose.orientation.w = 1.0;
             } 
         }
     }
@@ -753,6 +759,13 @@ void AIRO_CONTROL_FSM::external_command_preview_cb(const airo_message::Reference
 void AIRO_CONTROL_FSM::takeoff_land_cb(const airo_message::TakeoffLandTrigger::ConstPtr& msg){
     takeoff_land_trigger.header.stamp = msg->header.stamp;
     takeoff_land_trigger.takeoff_land_trigger = msg->takeoff_land_trigger;
+}
+
+void AIRO_CONTROL_FSM::battery_state_cb(const sensor_msgs::BatteryState::ConstPtr& msg){
+    battery_state.current = msg->current;
+    battery_state.header = msg->header;
+    battery_state.percentage = msg->percentage;
+    battery_state.voltage = msg->voltage;
 }
 
 bool AIRO_CONTROL_FSM::state_received(const ros::Time& time){
@@ -791,6 +804,10 @@ bool AIRO_CONTROL_FSM::takeoff_land_received(const ros::Time& time){
     return (time - takeoff_land_trigger.header.stamp).toSec() < COMMAND_TIMEOUT;
 }
 
+bool AIRO_CONTROL_FSM::battery_status_received(const ros::Time& time){
+    return (time - battery_state.header.stamp).toSec() < COMMAND_TIMEOUT;
+}
+
 bool AIRO_CONTROL_FSM::takeoff_trigered(const ros::Time& time){
     return takeoff_land_received(time) && takeoff_land_trigger.takeoff_land_trigger;
 }
@@ -815,4 +832,129 @@ void AIRO_CONTROL_FSM::reboot(){
 	reboot_srv.call(reboot);
 
 	ROS_INFO("FCU Rebooted!");
+}
+
+void AIRO_CONTROL_FSM::init_log(){
+    // Define column headers
+    std::vector<std::string> column_headers = {"time","ros_time","fsm_state","solve_controller","is_landed","is_armed","takeoff_land_trigger","is_waiting_for_cmd","use_preview","ref_x","ref_y","ref_z","ref_u","ref_v","ref_w","ref_ax","ref_ay","ref_az","ref_phi","ref_theta","ref_psi","x","y","z","u","v","w","ax","ay","az","phi","theta","psi","throttle","battery_voltage"};
+
+    // Get the current time
+    std::time_t now = std::time(nullptr);
+    std::tm tm = *std::localtime(&now);
+
+    // Format the time as "yyyy-mm-dd-hh-mm"
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y_%m_%d_%H_%M");
+    std::string time_stamp = oss.str();
+
+    // Get the path to the "airo_control" package
+    std::string package_path = ros::package::getPath("airo_control");
+
+    if (!package_path.empty()) {
+        // Construct the full file path
+        log_path = package_path + "/logs/" + time_stamp + ".csv";
+
+        // Open the file for writing
+        std::ofstream out_file(log_path);
+
+        // Check if the file was successfully opened
+        if (out_file.is_open()) {
+            // Write column headers as the first row
+            for (size_t i = 0; i < column_headers.size(); ++i) {
+                out_file << column_headers[i];
+                if (i < column_headers.size() - 1) {
+                    out_file << ",";
+                }
+            }
+            out_file << "\n";
+
+            // Close the file
+            out_file.close();
+            ROS_INFO_STREAM("[AIRo Control] Data saving to " << log_path);
+        } else {
+            ROS_ERROR_STREAM("[AIRo Control] Failed to open the file for writing: " << log_path);
+        }
+    }
+}
+
+void AIRO_CONTROL_FSM::update_log(){
+    Eigen::Vector3d local_euler,target_euler;
+    line_to_push.clear();
+
+    if (!log_started){
+        log_started = true;
+        line_to_push.push_back(0.0); // time
+        log_start_time = current_time;
+    }
+    else{
+        line_to_push.push_back((current_time - log_start_time).toSec()); // time
+    }
+    line_to_push.push_back(current_time.toSec());
+    line_to_push.push_back(state_fsm);
+    line_to_push.push_back(solve_controller);
+    line_to_push.push_back(is_landed);
+    line_to_push.push_back(is_armed);
+    line_to_push.push_back(takeoff_land_trigger.takeoff_land_trigger);
+    line_to_push.push_back(fsm_info.is_waiting_for_command);
+    line_to_push.push_back(use_preview);
+    if (solve_controller){
+        if (!use_preview){
+            line_to_push.push_back(controller_ref.ref.pose.position.x);
+            line_to_push.push_back(controller_ref.ref.pose.position.y);
+            line_to_push.push_back(controller_ref.ref.pose.position.z);
+            line_to_push.push_back(controller_ref.ref.twist.linear.x);
+            line_to_push.push_back(controller_ref.ref.twist.linear.y);
+            line_to_push.push_back(controller_ref.ref.twist.linear.z);
+            line_to_push.push_back(controller_ref.ref.accel.linear.x);
+            line_to_push.push_back(controller_ref.ref.accel.linear.y);
+            line_to_push.push_back(controller_ref.ref.accel.linear.z);
+        }
+        else{
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].pose.position.x);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].pose.position.y);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].pose.position.z);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].twist.linear.x);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].twist.linear.y);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].twist.linear.z);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].accel.linear.x);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].accel.linear.y);
+            line_to_push.push_back(controller_ref_preview.ref_preview[0].accel.linear.z);
+        }
+        target_euler = controller->q2rpy(attitude_target.orientation);
+        line_to_push.push_back(target_euler.x());
+        line_to_push.push_back(target_euler.y());
+        line_to_push.push_back(target_euler.z());
+    }
+    else{
+        for (int i = 0; i < 12; ++i) {
+            line_to_push.push_back(0.0);
+        }
+    }
+    line_to_push.push_back(local_pose.pose.position.x);
+    line_to_push.push_back(local_pose.pose.position.y);
+    line_to_push.push_back(local_pose.pose.position.z);
+    line_to_push.push_back(local_twist.twist.linear.x);
+    line_to_push.push_back(local_twist.twist.linear.y);
+    line_to_push.push_back(local_twist.twist.linear.z);
+    line_to_push.push_back(local_accel.accel.linear.x);
+    line_to_push.push_back(local_accel.accel.linear.y);
+    line_to_push.push_back(local_accel.accel.linear.z);
+    local_euler = controller->q2rpy(local_pose.pose.orientation);
+    line_to_push.push_back(local_euler.x());
+    line_to_push.push_back(local_euler.y());
+    line_to_push.push_back(local_euler.z());
+    line_to_push.push_back(attitude_target.thrust);
+    line_to_push.push_back(battery_state.voltage);
+
+    std::ofstream out_file(log_path,std::ios::app);
+    if (out_file.is_open()){
+        for (size_t i = 0; i < line_to_push.size(); ++i){
+            out_file << line_to_push[i];
+            if (i < line_to_push.size() -1){
+                out_file<<",";
+            }
+        }
+        out_file << "\n";
+        out_file.close();
+    }
 }
